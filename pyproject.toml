@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.30,<2.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,18 +7,19 @@ name = "first-agent"
 version = "0.1.0"
 description = "Locally orchestrated, mixed-tier LLM coding agent."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = { text = "Proprietary" }
 authors = [
   { name = "0oi9z7m1z8" },
 ]
 dependencies = [
   "markdown-it-py>=3.0",
-  # JSON-Schema Draft 2020-12 validator. Pinned by
-  # ADR-7 §5 «Input validation» as «single new dependency at this layer».
-  # Used by `ToolRegistry.dispatch` for per-call params validation and by
-  # `ToolRegistry.register` for schema-shape validation at registry init.
-  "jsonschema>=4.21",
+  # JSON-Schema Draft 2020-12 validator. Zero-transitive-deps drop-in
+  # replacing jsonschema. Compiles schema to a Python function (~10×
+  # faster validation). Used by `ToolRegistry.dispatch` for per-call
+  # params validation and by `ToolRegistry.register` for schema-shape
+  # validation at registry init.
+  "fastjsonschema>=2.21",
   # YAML parser for the ADR-9 §1 `~/.fa/models.yaml` config surface
   # (T-4 loader: `fa.providers.config.load_models_config_from_path`).
   # The hand-rolled `_yaml_subset.py` covers inline-comment stripping
@@ -54,6 +55,22 @@ dev = [
   # only because the runtime `yaml.safe_load` surface returns
   # `Any`-typed data the loader narrows immediately.
   "types-PyYAML>=6.0",
+  # Windows-native mutation testing (no fork / no WSL). Mirrors mutmut
+  # on Linux; required for the [tool.pytest-gremlins] config in this
+  # file to actually run on Windows dev machines.
+  "pytest-gremlins>=0.2",
+  # SCA floor: scans dependencies for known CVEs (PyPA-maintained).
+  # Run via `just audit` or `make audit`. Blocking gate.
+  "pip-audit>=2.7",
+  # Dependency hygiene: flags unused/missing/misplaced deps in pyproject.toml.
+  # Run via `just lint` / `make lint`. Blocking gate.
+  "deptry>=0.21",
+  # Parallel type checker (Meta, stable 1.0). Advisory-only; does not
+  # replace mypy. Run via `just typecheck-advisory`.
+  "pyrefly>=1.0",
+  # Pylint (strict profile for src/, relaxed for tests/). Two-pass because
+  # pylint does not support per-directory rc natively.
+  "pylint>=3.2",
 ]
 
 [project.scripts]
@@ -64,7 +81,8 @@ packages = ["src/fa"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py313"
+extend-exclude = ["catch-corpus", "fp-corpus"]
 
 [tool.ruff.lint]
 select = [
@@ -90,10 +108,11 @@ indent-style = "space"
 line-ending = "lf"
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
 strict = true
 warn_unused_configs = true
 files = ["src", "tests"]
+exclude = ["^catch-corpus/", "^fp-corpus/"]
 
 [tool.pytest.ini_options]
 # --cov gates: fail the suite if line coverage drops below the threshold set
@@ -163,7 +182,7 @@ tests_dir = ["tests/"]
 #
 # IMPORTANT: the matching CI job MUST install the project + dev extras
 # (`pip install -e ".[dev]"`) before invoking pylint. Without that, pylint
-# cannot import markdown_it / jsonschema / yaml / bashlex / pytest and emits
+# cannot import markdown_it / yaml / bashlex / pytest and emits
 # spurious E0401 import-error messages.
 # ---------------------------------------------------------------------------
 [tool.pylint.main]
@@ -172,6 +191,7 @@ init-hook = "import sys; sys.path.insert(0, 'src')"
 # Belt-and-suspenders: if a CI env can't install a runtime dep, don't let a
 # missing third-party module masquerade as a code error.
 ignored-modules = []
+ignore-paths = ["catch-corpus/.*", "fp-corpus/.*"]
 
 [tool.pylint."messages control"]
 disable = [
@@ -239,3 +259,41 @@ ignore-signatures = true   # similar function signatures are not duplication
 # CI passes when the score is at or above this. Real Errors/Warnings drag the
 # score down fast, so regressions still fail; lingering style nits don't.
 fail-under = 9.0
+
+# ---------------------------------------------------------------------------
+# pytest-gremlins — native-Windows mutation testing (no fork / no WSL).
+# Local spot-check that tests actually CATCH bugs, not just execute lines.
+# Run scoped to the high-risk sandbox folder:
+#   pytest tests/test_sandbox_*.py --gremlins --gremlin-parallel
+# CI keeps using mutmut on Linux (tests.yml); this is the Windows-dev mirror.
+# ---------------------------------------------------------------------------
+[tool.pytest-gremlins]
+paths = ["src/fa/sandbox"]
+operators = ["comparison", "arithmetic", "boolean", "boundary", "return"]
+exclude = ["**/test_*", "**/__init__.py"]
+report = ["console", "html"]
+cache = true
+
+[tool.pyrefly]
+project-includes = [
+    "src",
+    "tests",
+]
+python-version = "3.13.0"
+preset = "strict"
+# Advisory-only: suppress pyrefly-specific strictness rules that mypy does not
+# enforce, to avoid noise on a codebase written for mypy strict.
+# Revisit when migrating from mypy to pyrefly as primary type checker.
+[tool.pyrefly.errors]
+implicit-any-empty-container = false
+
+[tool.deptry.per_rule_ignores]
+# Dev-only packages are intentionally not imported in src/; they are
+# CLI tools (ruff, mypy, pre-commit, mutmut, pip-audit, deptry, pyrefly, pylint)
+# or test-scoped (pytest, pytest-asyncio, pytest-cov, pytest-gremlins)
+# or type stubs (types-PyYAML).
+DEP002 = [
+    "mypy", "pre-commit", "pytest", "pytest-asyncio", "pytest-cov",
+    "mutmut", "ruff", "types-PyYAML", "pytest-gremlins", "pip-audit",
+    "deptry", "pyrefly", "pylint",
+]

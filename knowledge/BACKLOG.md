@@ -1072,6 +1072,342 @@
   PR #20). M-7 (PR C) is not a blocker because IntentGuard
   wiring is explicitly out of M-8 scope (deferred follow-up).
 
+## I-10 — Remove `bashlex` dependency from `bash_intent` module
+
+- **Status:** deferred from dependency audit (2026-06-04).
+- **Idea:** `bashlex>=0.18` is the project's only stale runtime dependency
+  (last release 2023, no commits in 18 months, 30+ open issues).
+  It is used by `src/fa/inner_loop/bash_intent.py` to parse bash
+  command syntax into an AST for IntentGuard classification
+  (repo writes / index writes / verifier commands). Replace it
+  with a solution that has zero external dependencies while
+  preserving classification accuracy.
+- **Replacement options (pre-ranked):**
+  1. **Targeted `shlex` + heuristic regex** (preferred). `shlex`
+     (stdlib) tokenizes correctly; add a small state machine
+     (~60–80 lines) that classifies token sequences into the
+     same three buckets `bash_intent` produces today. Risk:
+     edge-case bash syntax (subshells, arrays, brace expansion)
+     may misclassify; mitigated by the fact that LLM-generated
+     bash in tool calls is overwhelmingly simple (single commands
+     or short pipelines).
+  2. **Vendor a minimal bash parser** (~200–300 lines). Fork the
+     subset of `bashlex` actually used (parser + AST visitor for
+     simple commands only). Higher maintenance burden, but
+     preserves exact AST semantics.
+  3. **Keep `bashlex` but pin exact version.** Not a removal, but
+     prevents silent upgrade to a broken future release. Fallback
+     if (1) or (2) proves infeasible.
+- **Blocked-on:** bash_intent API surface audit — a precise map of
+  every `bashlex` class/method used and the classification rules
+  they implement. Without this map the replacement cannot prove
+  parity.
+- **Unblock-trigger:** Either (a) bashlex confirmed abandoned
+  (no release in 24 months) OR (b) the API-surface audit PR lands
+  with a test matrix showing current classification results for
+  ≥20 representative bash snippets (simple command, pipeline,
+  subshell, variable assignment, git add/commit/push, rm, cp,
+  mkdir, pip install, etc.).
+- **First concrete step once unblocked:** Open a research spike PR
+  that replaces `bashlex` with option (1) (`shlex` + heuristics);
+  run the ≥20-snippet test matrix; if classification accuracy
+  ≥95 % → merge; if <95 % → try option (2) or fall back to
+  option (3) with a 12-month re-evaluation trigger.
+- **Why this satisfies minimalism-first.** Removing a stale
+  single-purpose dependency eliminates supply-chain risk and
+  reduces the project's external surface. The `shlex` path is
+  deterministic Python (AGENTS.md PR Checklist rule #10 q4) —
+  no LLM judgement required at runtime.
+- **References:**
+  - `src/fa/inner_loop/bash_intent.py` — current consumer.
+  - `src/fa/inner_loop/hooks/intent_guard.py` — downstream
+    consumer of `bash_intent` classifications.
+  - [`research/ci-qa-tooling-adversarial-2026-06.md`](./research/ci-qa-tooling-adversarial-2026-06.md)
+    §0 R-4 (gitleaks recommendation) — same audit session
+    surfaced this dependency risk.
+
+## I-11 — Cross-platform test suite (Windows without bash / Developer Mode)
+
+- **Status:** deferred from test audit (2026-06-04).
+- **Idea:** Three categories of tests fail on vanilla Windows:
+  1. **Bash-dependent tests** (6 in `test_cli.py`, 1 in
+     `test_inner_loop_runtime.py`, 1 in `test_inner_loop_runtime_limits.py`,
+     2 in `test_inner_loop_tools.py`). They invoke `fs.run_bash` which spawns
+     `bash` — not installed by default on Windows. Currently mitigated with
+     `@pytest.mark.skipif(shutil.which("bash") is None)` but this skips
+     silently; a better solution would use `cmd.exe` as a fallback shell on
+     Windows so the same logic is still exercised.
+  2. **Symlink-dependent tests** (3 in `test_sandbox_path_containment.py`,
+     3 in `test_hygiene_hooks_install.py`). They call `os.symlink()` which
+     requires Windows Developer Mode or admin privileges. With Developer Mode
+     enabled these pass; without it they fail. Mitigation:
+     `try/except (OSError, NotImplementedError)` or capability-based skip.
+  3. **POSIX-only tests** (1 in `test_chunker_plaintext.py`:
+     `test_anchor_falls_back_to_chunk_for_dot_only_name`). Windows forbids
+     creating files named `...` (path traversal pattern), so the test fixture
+     cannot be constructed. The chunker logic itself is fine; this is a test
+     construction limitation.
+- **Worth fixing?** The bash tests reveal the real gap: `fs.run_bash` is a
+  POSIX shell tool. A Windows-native agent would need `fs.run_cmd` or a shell
+  abstraction. The symlink tests are security-critical (sandbox escape
+  detection) — skipping them on Windows means the Windows dev never validates
+  the containment boundary locally.
+- **Blocked-on:** Decision on whether FA targets POSIX-only environments
+  (WSL, Git Bash, etc.) or native Windows. If POSIX-only, skip decorators
+  are sufficient and this item closes as "by design". If native Windows
+  is a target, the bash tool needs a `cmd.exe` / PowerShell backend and the
+  sandbox containment needs `os.path` semantics review.
+- **Unblock-trigger:** First user reports running FA on native Windows
+  without WSL, OR a CI job is added that runs on `windows-latest` and fails.
+- **First concrete step once unblocked:** Add a `windows-latest` CI matrix
+  entry (GitHub Actions) to surface these failures automatically. Then decide
+  per-category: skip (acceptable for bash), fix (for chunker fixture
+  construction), or refactor (for sandbox symlink escape — use junction
+  points on Windows instead of symlinks).
+- **References:**
+  - `tests/test_cli.py` — bash skip decorators added 2026-06-04.
+  - `tests/test_sandbox_path_containment.py` — symlink escape tests.
+  - `tests/test_chunker_plaintext.py::test_anchor_falls_back_to_chunk_for_dot_only_name`.
+  - `tests/test_hygiene_hooks_install.py` — hook symlink installation.
+
+## I-12 — Authoring rules: scope coverage gap (`scripts/`, `verifiers/`)
+
+- **Status:** deferred from ADR-11 PR-2 self-review (2026-06-06).
+- **Idea:** PR-2 Level-1 rules scope strictly: V2 (`exports.py`) scans
+  `src/` only; V4 / V11 (`tests.py`) scan `tests/` only. Two real
+  source trees are therefore **not** authoring-guarded today:
+  - `scripts/` — contains `check_protected_paths.py`, the
+    governance bundle's diff-checker. A regression here weakens the
+    TCB-write defense (ADR-11-I7) but no rule catches it.
+  - `verifiers/` — contains the DSV YAML contracts and helper Python.
+- **Worth fixing?** Yes, but low priority. `scripts/` is one file
+  today; `verifiers/` is YAML-heavy with little Python. The risk
+  surfaces if either grows: new helpers added without `__all__`
+  curation, or test helpers slipping into `verifiers/` with
+  `pytest.skip`.
+- **Blocked-on:** None. Two-line constant change in each rule
+  (`_INCLUDED_PREFIXES` tuple).
+- **Unblock-trigger:** Either tree gains a second `.py` file, OR a
+  V2-class regression is detected manually in `scripts/`.
+- **First concrete step once unblocked:** Extend `_INCLUDED_PREFIXES`
+  in `src/fa/authoring_rules/exports.py` to `("src/", "scripts/",
+  "verifiers/")`. Re-run `fa authoring-check` and triage any new
+  findings the same way `TimeSource` was triaged in PR-2 (add to
+  `__all__` or rename `_`-private).
+- **References:**
+  - `src/fa/authoring_rules/exports.py:41` — `_INCLUDED_PREFIXES`.
+  - `src/fa/authoring_rules/tests.py:54` — `_INCLUDED_PREFIXES`.
+  - ADR-11 §I-7 (protected-path bundle, lists `scripts/check_protected_paths.py`).
+
+## I-13 — V4 import-alias bypass (`from pytest import skip`)
+
+- **Status:** known limitation from ADR-11 PR-2 stress-test (2026-06-06).
+- **Idea:** V4 `TEST_SEMANTIC_DECAY` binds to the literal AST shape
+  `pytest.skip(...)` / `pytest.mark.skip`. An adversarial author (or
+  an LLM that has read the rule) can bypass with:
+  ```python
+  from pytest import skip
+  skip("nope")          # not detected
+  ```
+  The decorator form (`@pytest.mark.skip`) is unaffected because the
+  attribute chain is the same regardless of how `pytest` was imported.
+- **Cost / benefit:** Implementing full import-alias tracking via
+  `ast.NodeVisitor` is ~half a day (one visitor that builds a
+  `name → fully-qualified-name` map). The corresponding risk is real
+  but small: bypass requires the author to deliberately write a less
+  idiomatic import. Net cost-of-bypass is now ≈30 seconds of typing,
+  same order as commenting the rule out — already covered by
+  ADR-11 §12.4 (the bar is "raise the cost of bypass", not "prove
+  impossibility").
+- **Blocked-on:** None. Pure implementation work in
+  `src/fa/authoring_rules/tests.py`.
+- **Unblock-trigger:** Either an `fp-corpus` measurement (PR-4)
+  surfaces a real bypass in production, OR ADR-11 §12.4 is amended
+  to require full alias-tracking for all V4-class rules.
+- **First concrete step once unblocked:** Add an import-walker pass
+  before the AST-walk; build a `{local_name: pytest.<attr>}` map for
+  each file; widen `_is_pytest_call` / `_pytest_mark_attr` to consult
+  the map. Add fixture tests for the four bypass shapes
+  (`from pytest import skip`, `import pytest as pt`, `pt.skip(...)`,
+  `pt.mark.skip`).
+- **References:**
+  - `src/fa/authoring_rules/tests.py:62` — `_is_pytest_call`.
+  - `src/fa/authoring_rules/tests.py:73` — `_pytest_mark_attr`.
+  - ADR-11 §12.4 (regex/AST bypass acknowledged risk).
+
+## I-14 — ADR-11 PR-3+ rule packs (V3, V5, V7, V10, V12, V14)
+
+- **Status:** scheduled per blueprint Appendix B; PR-2 landed
+  2026-06-06 with V2 / V4 / V11.
+- **Idea:** Remaining V-N codes from the F-1..F-10 catch-corpus table:
+  - **V3 — generation parity** (F-3 `SQUASH_MSG` Python↔Bash drift).
+    Lives in `src/fa/authoring_rules/parity.py`. **PR-3.**
+  - **V5 — doc integrity** (F-5 stale BACKLOG, F-6 missing `llms.txt`
+    entry). Lives in `src/fa/authoring_rules/docs.py`. **PR-3.**
+  - **V6 — session seam** (`.fa/session.toml` staged-paths ⊆ seam).
+    Lives in `src/fa/authoring_rules/seam.py`. **PR-4** alongside
+    the `catch-corpus/` + `fp-corpus/` directories.
+  - **V7 — SSOT enum** (F-1 bash-intent classifier shape).
+    Advisory-first. **PR-3 or later.**
+  - **V10 — reference safety** (F-8 signature change with missed
+    call-sites). Requires inter-procedural / call-graph analysis;
+    **deferred indefinitely until a stdlib AST approach is proven
+    cheap enough** (Semgrep-OSS is intra-procedural so wouldn't
+    help; the adversarial note R-8 already documents this).
+  - **V12 — message registry**. **PR-5.**
+  - **V14 — AI session trailers** (F-10 `Co-authored-by` omitted).
+    Procedural until harness emits read-receipts; **deferred per
+    ADR-11-I8** ("I-BOOT is procedural until the harness can emit
+    read receipts").
+- **Blocked-on:** PR-2 has now landed. Roadmap proceeds PR-3 → PR-4 → PR-5.
+- **Unblock-trigger:** PR-2 is merged + no FP regressions surface
+  in the first week of production use.
+- **First concrete step once unblocked:** PR-3 — create
+  `src/fa/authoring_rules/parity.py` with a single rule pinning
+  `SQUASH_MSG` between `src/fa/hygiene/pr_intent.py` and the
+  git hook bash script (the existing
+  `tests/test_pr_intent_snapshot.py` is the seed pattern).
+- **References:**
+  - `knowledge/research/ADR-11-Authoring-Guardrails-Blueprint.md`
+    Appendix B (full rollout schedule).
+  - `src/fa/authoring_rules/README.md` (rollout table, PR-2 marked done).
+
+## R-7 — DEFER `ty` as primary type checker until stable 1.0
+
+- **Status:** deferred from CI/QA tooling audit (2026-06-04).
+- **Idea:** Astral's `ty` is beta (v0.0.37); no plugin system, different unannotated-body semantics than mypy. Migration is technically viable (FA has no mypy plugins) but premature.
+- **Blocked-on:** `astral-sh/ty` releases 1.0.0.
+- **Unblock-trigger:** `astral-sh/ty` releases 1.0.0.
+- **First concrete step once unblocked:** Re-evaluate mypy vs ty migration on the then-current FA codebase; run both in parallel for one cycle before flipping the gate.
+- **References:** [`research/ci-qa-tooling-adversarial-2026-06.md`](./research/ci-qa-tooling-adversarial-2026-06.md) §0 R-7.
+
+## R-8 — DEFER custom Semgrep rules for `@tool` surface until harness stabilizes
+
+- **Status:** deferred from CI/QA tooling audit (2026-06-04).
+- **Idea:** Custom Semgrep rules for `@tool` decorator boundaries, MCP protocol misuse, and LLM-tainted args are valuable, but FA's tool surface is still evolving.
+- **Blocked-on:** ADR-8 / HookRegistry contract freeze.
+- **Unblock-trigger:** "Custom Semgrep rules blocked on ADR-8 freeze"
+- **First concrete step once unblocked:** Author custom Semgrep YAML rules targeting `src/fa/inner_loop/tools/` and `src/fa/inner_loop/registry.py`; run them advisory for 4 weeks before promoting to blocking.
+- **References:** [`research/ci-qa-tooling-adversarial-2026-06.md`](./research/ci-qa-tooling-adversarial-2026-06.md) §0 R-8.
+
+## R-9 — DEFER DeepEval / Promptfoo agent eval harness until UC5
+
+- **Status:** deferred from CI/QA tooling audit (2026-06-04).
+- **Idea:** Agent behavioral evaluation is critical (Pillar 4), but FA has no stable inner-loop contract or golden prompt dataset yet. Eval without a stable harness measures noise.
+- **Blocked-on:** UC5 eval-harness infrastructure + inner-loop contract freeze.
+- **Unblock-trigger:** "UC5 eval-harness: evaluate DeepEval vs Promptfoo after inner-loop contract freeze"
+- **First concrete step once unblocked:** Build a golden prompt dataset (≥20 hand-annotated sessions), integrate both DeepEval and Promptfoo in parallel advisory jobs, and pick the one with lower FP rate on the golden set.
+- **References:** [`research/ci-qa-tooling-adversarial-2026-06.md`](./research/ci-qa-tooling-adversarial-2026-06.md) §0 R-9.
+
+## R-10 — DEFER `Tach` module boundary enforcement until module count > 5
+
+- **Status:** deferred from CI/QA tooling audit (2026-06-04).
+- **Idea:** Tach enforces import boundaries between modules. FA currently has ~15 top-level packages under `src/fa/`, but most are tightly coupled and not independently deployable.
+- **Blocked-on:** `src/fa/` exceeds 5 independently deployable modules.
+- **Unblock-trigger:** "Adopt Tach when module count > 5"
+- **First concrete step once unblocked:** Add `tach.toml` with import boundaries between the independently deployable modules; gate CI on `tach check`.
+- **References:** [`research/ci-qa-tooling-adversarial-2026-06.md`](./research/ci-qa-tooling-adversarial-2026-06.md) §0 R-10.
+
+## R-11 — SKIP `garak` adversarial scanning for now
+
+- **Status:** skip from CI/QA tooling audit (2026-06-04).
+- **Idea:** NVIDIA's `garak` probes LLMs for jailbreaks, prompt injection, and data extraction. Complementary to SAST.
+- **Blocked-on:** FA exposes a network-facing agent endpoint.
+- **Unblock-trigger:** FA exposes a network-facing agent endpoint.
+- **First concrete step once unblocked:** Evaluate garak v0.14+ against the live endpoint; integrate as an advisory nightly scan.
+- **References:** [`research/ci-qa-tooling-adversarial-2026-06.md`](./research/ci-qa-tooling-adversarial-2026-06.md) §0 R-11.
+
+## R-12 — SKIP `CodeQL` deep taint analysis
+
+- **Status:** skip from CI/QA tooling audit (2026-06-04).
+- **Idea:** CodeQL provides deeper inter-procedural taint than Semgrep OSS, but it is slow and memory-heavy. FA's threat model is authoring-time, not runtime taint.
+- **Blocked-on:** Semgrep advisory proves useful and deeper taint is needed.
+- **Unblock-trigger:** Semgrep advisory surfaces actionable findings that require inter-procedural taint.
+- **First concrete step once unblocked:** Enable CodeQL weekly as a deeper nightly layer alongside Semgrep.
+- **References:** [`research/ci-qa-tooling-adversarial-2026-06.md`](./research/ci-qa-tooling-adversarial-2026-06.md) §0 R-12.
+
+## R-13 — SKIP `Vulture` dead-code detection as a CI gate
+
+- **Status:** skip from CI/QA tooling audit (2026-06-04).
+- **Idea:** Vulture finds dead code (unused functions/classes/variables). AI projects accumulate it, but Vulture has high false positives on dynamically dispatched code.
+- **Blocked-on:** Manual dead-code audit desired (monthly).
+- **Unblock-trigger:** Manual dead-code audit desired (monthly).
+- **First concrete step once unblocked:** Run `make deadcode` (`vulture src/ --min-confidence 90`) manually; do not gate CI on it.
+- **References:** [`research/ci-qa-tooling-adversarial-2026-06.md`](./research/ci-qa-tooling-adversarial-2026-06.md) §0 R-13.
+
+## R-14 — SKIP `pytest-recording` / VCR.py for LLM mocks
+
+- **Status:** skip from CI/QA tooling audit (2026-06-04).
+- **Idea:** VCR.py records HTTP fixtures for deterministic CI. FA's test suite mocks LLM calls at the `ProviderAdapter` level — no real HTTP traffic in tests yet.
+- **Blocked-on:** Tests introduce HTTP-dependent components (provider client integration tests).
+- **Unblock-trigger:** Tests introduce HTTP-dependent components (provider client integration tests).
+- **First concrete step once unblocked:** Add `pytest-recording` and record cassettes for the first HTTP-dependent test.
+- **References:** [`research/ci-qa-tooling-adversarial-2026-06.md`](./research/ci-qa-tooling-adversarial-2026-06.md) §0 R-14.
+
+## I-20 — V2 nested tuple-unpacking definitions
+
+- **Status:** deferred from PR-11 (PR-10 follow-up).
+- **Idea:** `_public_symbols` walks the first level of `ast.Tuple` / `ast.List` assignment targets at module scope, but does NOT recurse into nested tuples (`(a, (b, c)) = ...`). The structurally-correct extension is to recurse, registering each leaf `ast.Name` against the outer `Assign` node.
+- **Blocked-on:** None technically; deferred because the live repo has zero instances of nested top-level tuple unpacking with `__all__`.
+- **Unblock-trigger:** ≥1 instance of nested top-level tuple unpacking appears under `src/` in a module with `__all__`.
+- **First concrete step once unblocked:** Extend `_register` in `_public_symbols` to recurse into nested `ast.Tuple`/`ast.List` targets; add fixture under `catch-corpus/F-2-nested/` and a regression test mirroring the existing `test_tuple_unpacking_at_top_level_is_flagged`.
+
+## I-21 — V2 phantom-name inverse check
+
+- **Status:** deferred from PR-11 (PR-10 follow-up). Originally proposed as a pass-1 HIGH item; dropped because the live repo has 16 `__init__.py` modules that re-export symbols via plain `from .x import Foo` listed in `__all__`. Naive enforcement would HARD-BLOCK every one of them.
+- **Idea:** Catch names that appear in `__all__` but have no in-module definition (the F822 ruff check, lifted into the authoring kernel for completeness with ADR-11-I2's "kernel is authoritative" stance).
+- **Blocked-on:** A definition-predicate extension that treats plain `from .x import Foo` as a "definition for the purpose of `__all__` membership only" (the rule's primary direction — defined-but-not-in-`__all__` — must continue to NOT count plain imports, or BLOCKER-1 territory re-opens).
+- **Unblock-trigger:** Any PR with a phantom name in `__all__` slips past ruff F822 on `main`, OR ruff is removed / disabled in CI.
+- **First concrete step once unblocked:** Add `_public_symbols_for_phantom_check(tree, declared_all)` that treats `ImportFrom` targets named in `declared_all` as definitions; emit `FA-AUTHORING-V2-EXPORTS-PHANTOM` for names in `__all__` absent from that extended set.
+
+## I-12-bis — Manifest-driven scope for Level-1 rules
+
+- **Status:** deferred from PR-11 (PR-10 follow-up). Original "PR-14" idea consolidated into the next PR-4 cycle per ADR-11 Appendix B.
+- **Idea:** Replace the hard-coded `SRC_SCOPE`/`TEST_SCOPE` tuples in `src/fa/authoring_rules/_scan.py` with a manifest-driven scope read from `.fa/session.toml [scope]` (fields `src_prefixes`, `test_prefixes`). Lets monorepo layouts (`core/src/`, `plugins/src/`) scope the rules without rule-pack edits, and makes scope auditable from one place.
+- **Blocked-on:** ADR-11 PR-4 (`.fa/session.toml` schema; `seam.py`). The manifest does not exist on `main` today (`ls .fa/` is empty); creating it ahead of PR-4 would invert the published Appendix B rollout.
+- **Unblock-trigger:** ADR-11 PR-4 lands `.fa/session.toml` schema + `seam.py`.
+- **First concrete step once unblocked:** Extend `parse_manifest` to recognise `[scope]` table; add `Manifest.scope: ScopeConfig` field; rule packs read `context.manifest.scope.<prefix>` with fall-back to `SRC_SCOPE`/`TEST_SCOPE` when no manifest is supplied.
+
+## I-22 — Per-file source decode caching for rule packs
+
+- **Status:** deferred from PR-12 (PR-10 follow-up).
+- **Idea:** `iter_python_files` is called once per rule; each call reads bytes and re-parses. Cache `(path → (bytes, tree))` in `RuleContext` and have rules consume the pre-parsed tree. ~50 LOC; eliminates linear-in-rule-count IO/parse cost.
+- **Blocked-on:** None technically; deferred because the rule count is small (3) and end-to-end runtime is 0.057 s on the test corpus. The improvement becomes visible only at ≥5 rules.
+- **Unblock-trigger:** `len(RULE_ALLOWLIST) >= 5` on `main` (next reached when PR-3 lands `parity.py` + `docs.py`).
+- **First concrete step once unblocked:** Extend `RuleContext` with `parsed: Mapping[str, tuple[bytes, ast.Module]]`; lazy-populate in the kernel pre-pass (PR-12's `_parse_visibility_diagnostics` already does the parse — share the result).
+
+## I-15 — Visitor framework for shared `ast.walk`
+
+- **Status:** deferred from PR-12 (PR-10 follow-up).
+- **Idea:** Multiple Level-1 rules walk the same `ast.Module` independently. A small visitor framework (the Grafema `Analysis.Walker` pattern ADR-11 §Prior Art cites) lets N rules share one traversal per file.
+- **Blocked-on:** I-22 (per-file caching) lands first — without cached trees, the visitor framework gains nothing.
+- **Unblock-trigger:** I-22 merged AND `len(RULE_ALLOWLIST) >= 5`.
+- **First concrete step once unblocked:** Define `Visitor` protocol with `visit_<NodeType>` dispatch; convert existing rules incrementally; benchmark before/after.
+
+## I-16 — Read-receipt artefact (path + sha256) per rule inspection
+
+- **Status:** deferred from PR-12 (PR-10 follow-up).
+- **Idea:** The kernel logs `(rule, path, sha256)` for every file a rule actually inspected, surfaced in the JSON wire form. Enables byte-exact replay diff across PRs (the I-AUDIT operational invariant from `PR-10-review-pass2.md`).
+- **Blocked-on:** Harness emits run-receipts in the inner loop (ADR-11-I8 procedural-until-receipts comment); without a consumer the artefact has no name.
+- **Unblock-trigger:** Inner-loop run-receipt format is defined (cross-link to ADR-8 HookRegistry receipt work).
+- **First concrete step once unblocked:** Extend `RuleContext` with a `record_inspection(rule, path, sha256)` callback; aggregate into `KernelReport.inspections` field; update JSON schema.
+
+## I-17 — `.fa/authoring-suppressions.toml` mechanism
+
+- **Status:** deferred from PR-12 (PR-10 follow-up).
+- **Idea:** Frozen TOML file listing `(code, path, rule_input_hash, expires_on, justification, signed_by)` for kernel-acknowledged suppressions. Suppressions live OUTSIDE source code so agent edits are glaringly visible; the kernel drops matching diagnostics but emits an INFO listing every active suppression.
+- **Blocked-on:** A measured need — ADR-11 currently has no suppression mechanism and minimalism-first says we add one only when forced.
+- **Unblock-trigger:** ≥3 acknowledged false-positive findings on `main` cannot be resolved through the `fp-corpus/` measurement loop within 1 week.
+- **First concrete step once unblocked:** One ADR-11 amendment paragraph choosing between "frozen suppression TOML" and "forbid loudly + corpus-only"; the amendment becomes the spec for the implementation PR.
+
+## I-19 — `# fa-noqa` inline-suppression policy decision
+
+- **Status:** deferred from PR-12 (PR-10 follow-up).
+- **Idea:** Same problem space as I-17 but at line granularity. The kernel currently has no `# noqa`-style mechanism (good — keeps the trust boundary clean); when an LLM agent encounters a HARD-BLOCK, the path of least resistance is to look for an inline suppression syntax.
+- **Blocked-on:** I-17 — the line-level decision should follow the file-level one, not lead it.
+- **Unblock-trigger:** I-17 merged AND ≥1 PR explicitly asks for line-level suppression after file-level mechanism exists.
+- **First concrete step once unblocked:** Decide on the suppression syntax (`# fa-noqa: V<N>` vs. `# fa-suppress(<CODE>): <justification>`); implement parser; integrate with the per-finding hash so a suppression cannot drift to a different finding silently.
+
 ## See also
 
 - [`knowledge/MAINTENANCE.md`](./MAINTENANCE.md) — recurring

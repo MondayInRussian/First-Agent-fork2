@@ -1,0 +1,86 @@
+name: Advisory CI
+
+# Local-first architecture: the authoritative gate is `just check` run by the
+# developer/agent before push. GitHub CI is an advisory double-check.
+# Only the lightweight sanity-check job is blocking (verifies `just check`
+# was not skipped). `uv.lock` is committed; `uv lock --check` is a blocking
+# gate. If it fails, run `uv lock` locally and commit the updated lockfile.
+#
+# Blocking gates: sanity-check (just check), audit (pip-audit), gitleaks.
+# Advisory jobs: pyrefly (type-checking signal).
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  sanity-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Install just
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+
+      - name: Verify uv.lock is up-to-date
+        # Fails if pyproject.toml was edited but uv.lock was not regenerated
+        # (R-1 reproducible-builds). Run `uv lock` locally to fix.
+        run: uv lock --check
+
+      - name: Install Python dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run checks (ruff + deptry + mypy + authoring-check + pytest, with coverage gate)
+        run: uv run just check
+
+      - name: Upload coverage report (read by GitHub Code coverage analysis)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 14
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.2.0
+      - run: uv sync --frozen --extra dev
+      - name: Run pip-audit (SCA floor)
+        run: uv run pip-audit
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run gitleaks detect
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          # Pin the gitleaks binary version so pre-commit and CI run the
+          # SAME rule set. Must match the `rev:` for gitleaks in
+          # .pre-commit-config.yaml. Bump both together.
+          GITLEAKS_VERSION: "8.30.1"
+
+  pyrefly:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.2.0
+      - run: uv sync --frozen --extra dev
+      - name: Run pyrefly (advisory type-checking signal)
+        run: uv run pyrefly check

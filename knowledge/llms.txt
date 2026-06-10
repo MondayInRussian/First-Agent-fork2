@@ -113,22 +113,38 @@ PR-intent classifier + git-hook installer (M-6 / M-7 producer side). Shared vali
 - `src/fa/hygiene/hooks/install.py` — `install_hooks()` symlinks the `prepare-commit-msg` / `commit-msg` scripts into `.git/hooks/`. Tested by `tests/test_hygiene_hooks_install.py`.
 - `src/fa/hygiene/tokens.py` / `discover.py` / `suggestions.py` — token classification, record discovery, and hygiene suggestions helpers.
 
+### Authoring guardrails (`src/fa/authoring_tcb.py`, `src/fa/authoring_rules/`, `scripts/check_protected_paths.py`)
+
+ADR-11 two-tier TCB: frozen stdlib-only Level-0 kernel + allowlisted Level-1 rule packs, CI-enforced, protected-path-governed.
+
+- `src/fa/authoring_tcb.py` — Level-0 kernel (`RuleResult`, `Rule` protocol, `run_all`, SHA-256 hashing, deterministic sorted output, fail-closed). Frozen and stdlib-only (ADR-11-I1).
+- `src/fa/authoring_rules/__init__.py` — static `RULE_ALLOWLIST` dispatch. PR-2 ships three rules (HARD-BLOCK): `EXPORTS_COMPLETENESS` (V2, F-2/F-7 `__all__` completeness), `TEST_SEMANTIC_DECAY` (V4 family: `pytest.skip` / non-strict `xfail` / focus markers, ADR-11-I5), `PLACEHOLDER_ASSERTION` (V11, ADR-11-I5 + F-9 tautological asserts).
+- `src/fa/authoring_rules/README.md` — I-BOOT authoring read-set (ADR-11-I8): contract, diagnostic-code namespace, severity lifecycle, rollout table.
+- `src/fa/authoring_rules/exports.py` — V2 rule pack: `__all__` completeness (defs + explicit re-exports only; module-private-by-convention `LOGGER`/`logger`/`log` ignored).
+- `src/fa/authoring_rules/tests.py` — V4 + V11 rule packs (ADR-11-I5 test semantic decay): `pytest.skip` call/decorator, non-strict `xfail`, focus markers, placeholder assertions.
+- `src/fa/authoring_rules/_scan.py` — internal helper (`iter_python_files`, `sha256`, `node_input_hash`) shared by Level-1 rule packs; centralises scope-filtering and skips the `catch-corpus/` / `fp-corpus/` directories so corpus fixtures cannot fail the regular kernel run.
+- `scripts/check_protected_paths.py` — CI diff-checker: `realpath`-resolved denylist for TCB paths, non-blocking by default, GitHub Actions annotations (ADR-11-I7).
+- `.github/workflows/authoring-guardrails.yml` — always-run CI workflow (no `paths:` filter, ADR-11-I6); runs `fa authoring-check` + `check_protected_paths.py` on PRs.
+- CLI: `fa authoring-check --workspace <path> --manifest <toml> --output text|json`.
+
 ### Tooling & CI (`pyproject.toml`, `.pylintrc-tests`, `.github/workflows/`)
 
-Quality gates run in CI. `make check` (ruff + mypy + pytest) mirrors CI locally; thresholds live in `pyproject.toml`, not in workflow YAML.
+Quality gates run in CI. `make check` (ruff + mypy + authoring-check + pytest) mirrors CI locally; thresholds live in `pyproject.toml`, not in workflow YAML.
 
-- `pyproject.toml` — single config surface: ruff, mypy (strict), pytest, `[tool.coverage.*]` (branch coverage + `fail_under = 90`), `[tool.pylint.*]` (cosmetic checks disabled, `duplicate-code` kept ON for src, `fail-under = 9.0`), `[tool.mutmut]`.
+- `pyproject.toml` — single config surface: ruff, mypy (strict), pytest, `[tool.coverage.*]` (branch coverage + `fail_under = 90`), `[tool.pylint.*]` (cosmetic checks disabled, `duplicate-code` kept ON for src, `fail-under = 9.0`), `[tool.mutmut]`, `[tool.pyrefly]`, `[tool.deptry]`.
 - `.pylintrc-tests` — tests-only pylint profile; relaxes pytest idioms (fixtures, test-double args, protected-access) and disables `duplicate-code` / `C1803` for `tests/` (the src profile keeps them ON). Two-pass lint because pylint does not auto-merge per-directory rc.
-- `.github/workflows/ci.yml` — ruff + mypy + pytest (coverage-gated at 90%); uploads `coverage.xml` for GitHub Code coverage analysis.
-- `.github/workflows/pylint.yml` — two-pass pylint (src strict w/ duplicate-code; tests relaxed via `.pylintrc-tests`). Installs `.[dev]` so imports resolve (no spurious `E0401`).
-- `.github/workflows/tests.yml` — mutation testing (`mutmut`) only; manual + weekly, advisory (not a PR gate). Guards against tests that pass but assert nothing.
+- `justfile` / `Makefile` — cross-platform task runner (`just` preferred) translating all local recipes: `install`, `lint` (ruff + deptry), `format`, `typecheck` (mypy), `typecheck-advisory` (pyrefly), `authoring-check`, `test`, `audit` (pip-audit), `deadcode` (vulture), `check`.
+- `.github/workflows/advisory.yml` — advisory-only CI (local-first architecture): blocking `sanity-check` (`uv lock --check` then `just check`), blocking `audit` (pip-audit), blocking `gitleaks`, advisory `pyrefly` (`continue-on-error: true`). All `uv sync` calls use `--frozen` (R-1 reproducible-builds; `uv.lock` is committed).
+- `.github/workflows/pylint.yml` — two-pass pylint (src strict w/ duplicate-code; tests relaxed via `.pylintrc-tests`). Installs via `uv sync --frozen --extra dev`.
+- `.github/workflows/tests.yml` — mutation testing (`mutmut`) only; manual + weekly, advisory (not a PR gate). Installs via `uv sync --frozen --extra dev`.
+- `.github/workflows/semgrep.yml` — Semgrep OSS SAST (`--config=p/python --config=p/owasp-top-ten`); weekly + manual dispatch only (no `pull_request:` trigger per R-5), advisory (`continue-on-error: true`).
 
 ### Project knowledge (`knowledge/`)
 
 - [knowledge/glossary.md](./knowledge/glossary.md): Term definitions. Listed in §MUST READ FIRST.
 - [knowledge/README.md](./knowledge/README.md): Knowledge folder layout, schemas for `trace/` files, file placement rules.
 - [knowledge/project-overview.md](./knowledge/project-overview.md): Four-pillar goal, minimalism-first principle, v0.1 scope, three-stage evolution. Listed in §MUST READ FIRST.
-- [knowledge/BACKLOG.md](./knowledge/BACKLOG.md) (Large): Deferred ideas with unblock triggers. Active milestones: M-6 (PR B), M-7 (PR C). Closed: M-1..M-5, I-9.
+- [knowledge/BACKLOG.md](./knowledge/BACKLOG.md) (Large): Deferred ideas with unblock triggers. Includes R-7..R-14 deferred CI/QA recommendations (ty, custom Semgrep rules, DeepEval/Promptfoo, Tach, garak, CodeQL, Vulture, pytest-recording). Active milestones: M-6 (PR B), M-7 (PR C). Closed: M-1..M-5, I-9.
 - [knowledge/MAINTENANCE.md](./knowledge/MAINTENANCE.md): Cross-reference cascade rules — touch-lists for archiving, amending, superseding, adding files. Companion to `BACKLOG.md`.
 - [knowledge/architecture.md](./knowledge/architecture.md): High-level architecture overview (inner-loop runtime, provider chain, hook families, sandbox + draft-first enforcement, ADR-10 invariants) with Mermaid diagram.
 
@@ -147,6 +163,7 @@ Quality gates run in CI. `make check` (ruff + mypy + pytest) mirrors CI locally;
 - [knowledge/adr/ADR-8-hook-registry.md](./knowledge/adr/ADR-8-hook-registry.md): HookRegistry lifecycle contract: Guard/Observer middleware, lifecycle points, first-deny short-circuit.
 - [knowledge/adr/ADR-9-llm-provider-client.md](./knowledge/adr/ADR-9-llm-provider-client.md): Per-role explicit provider chain with per-(provider,slug) cooldown. T-2 driver + T-4 loader landed.
 - [knowledge/adr/ADR-10-deterministic-harness-invariants.md](./knowledge/adr/ADR-10-deterministic-harness-invariants.md): Five named invariants (I-1..I-5) every harness component must satisfy. Proposed 2026-05-25. Companion §1.2.5 in project-overview.md.
+- [knowledge/adr/ADR-11-authoring-guardrails.md](./knowledge/adr/ADR-11-authoring-guardrails.md): Authoring-time guardrails — two-tier TCB (frozen stdlib Level-0 kernel + allowlisted Level-1 rules), `ADR-11-I1..I8` slate, LLM-as-Untrusted-Compiler threat model. Proposed 2026-06-01; amended same day (contract freeze: §Verification + `FA-AUTHORING-V<N>` code namespace + single `.fa/session.toml`).
 
 ### Anti-pattern catalog (`knowledge/anti-patterns/`)
 
@@ -157,7 +174,7 @@ Quality gates run in CI. `make check` (ruff + mypy + pytest) mirrors CI locally;
 
 ### Exploration log (`knowledge/trace/`)
 
-- [knowledge/trace/exploration_log.md](./knowledge/trace/exploration_log.md) (Large): Alternatives rejected at decision time — Q-1..Q-15 with Chosen/Rejected/Lesson/Coupling. Cheap-read overlay for ADR rationale.
+- [knowledge/trace/exploration_log.md](./knowledge/trace/exploration_log.md) (Large): Alternatives rejected at decision time — Q-1..Q-16 with Chosen/Rejected/Lesson/Coupling. Cheap-read overlay for ADR rationale.
 
 ### Prompts (`knowledge/prompts/`)
 
@@ -169,6 +186,7 @@ Quality gates run in CI. `make check` (ruff + mypy + pytest) mirrors CI locally;
 - [knowledge/prompts/coder-recovery.md](./knowledge/prompts/coder-recovery.md): Coder error-recovery prompt fragment, reads `attempt_history.json`.
 - [knowledge/prompts/handoff-summarizer.md](./knowledge/prompts/handoff-summarizer.md): Session-handoff / compaction prompt. Verbatim identifier preservation + 5-block structure. For inner-loop compaction and session-end notes, not for `HANDOFF.md`.
 - [knowledge/prompts/research-briefing.md](./knowledge/prompts/research-briefing.md): Research-briefing workflow prompt. Stage 1 goal_lens elicitation.
+- [knowledge/prompts/ci-qa-implementation-session-start.md](./knowledge/prompts/ci-qa-implementation-session-start.md): Session-start prompt for implementing CI/QA tooling TAKE recommendations (R-1..R-15) from research note. Concrete file edits, not research.
 
 ### Skills (`knowledge/skills/`)
 
@@ -198,3 +216,8 @@ Quality gates run in CI. `make check` (ruff + mypy + pytest) mirrors CI locally;
 - [knowledge/research/provider-client-survey-2026-05.md](./knowledge/research/provider-client-survey-2026-05.md): [goal: Audit 8 OSS LLM provider clients to validate ADR-9 Option D + α.] Companion to ADR-9.
 - [knowledge/research/correlated-llm-errors-and-ensembling-2026-05.md](./knowledge/research/correlated-llm-errors-and-ensembling-2026-05.md) (Large): [goal: Cross-reference 4 arxiv papers on correlated LLM errors against ADR-1/2/7. 9 R-Ns across §0 + §10.]
 - [knowledge/research/fa-abc-synthesis-deep-dive-2026-05.md](./knowledge/research/fa-abc-synthesis-deep-dive-2026-05.md) (Large): [goal: 9-repo determinism-pattern deep-dive → ADR-10 invariants I-1..I-5.] Jump-table use: read §0+§3+§4+§6 (~5k tokens), open §1.x only for cited pattern IDs.
+- [knowledge/research/ci-qa-tooling-adversarial-2026-06.md](./knowledge/research/ci-qa-tooling-adversarial-2026-06.md): [goal: Adversarial review of CI/QA tooling for AI-managed Python. Tiered matrix: 6 GO / 4 DEFER / 4 SKIP. Stress-tests baseline claims with primary-source evidence.]
+- [knowledge/research/linux-dev-env-wsl2-2026-06.md](./knowledge/research/linux-dev-env-wsl2-2026-06.md): [goal: WSL2 + Ubuntu 24.04 recommended path for Windows 11 Pro contributors. Hardware-tuned .wslconfig, setup commands, CI parity rationale.]
+- [knowledge/research/homelab-deployment-24-7-2026-06.md](./knowledge/research/homelab-deployment-24-7-2026-06.md): [goal: Production-tested 24/7 FA deployment on dedicated Ubuntu Desktop AIO. Docker CE + Tailscale + systemd stack with real-world citations. 434 lines.]
+- [knowledge/research/First-Agent-ops-cross-reference.md](./knowledge/research/First-Agent-ops-cross-reference.md): [goal: Three-source cross-reference of production deployment research. Resolves 7 domain disagreements. Authoritative SSOT for the AIO stack.]
+- [knowledge/SETUP_AIO.md](./knowledge/SETUP_AIO.md): [goal: Step-by-step bootstrap guide for deploying FA on a dedicated AIO. 10 phases from BIOS to backup. Operational quick reference and recovery procedures.]

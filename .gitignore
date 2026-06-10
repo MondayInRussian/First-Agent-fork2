@@ -7,11 +7,31 @@ __pycache__/
 dist/
 build/
 .fa/
-uv.lock
 .devin/
+
+# Environment files (may contain secrets like B2 credentials)
+.env*
+!.env.example
+!.env.fa.template
+
+# Explicit secret markers (already covered by .env* above, but explicit for operators)
+.env.fa
+
+# Prevent accidental copies of FA config files into repo
+models.yaml
+config.yaml
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
 
 # Coverage / mutation artifacts
 .coverage
 coverage.xml
 htmlcov/
 .mutmut-cache
+.gremlins-cache/
+gremlin-report.html

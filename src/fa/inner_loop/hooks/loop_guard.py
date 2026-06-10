@@ -29,6 +29,11 @@ LoopGuard is **stateful per instance**: the trailing window lives on
 ``self``. Tests build a fresh registry per case; the smoke CLI builds
 a fresh registry per ``fa run`` invocation. There is no cross-run
 leakage.
+
+The ``_warned`` set is never cleared during a single session: once a
+warn fires for a given detector/key combo it will not fire again,
+even if the pattern disappears and re-emerges later. This is
+intentional log-spam reduction, not a bug.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import override
 
 from fa.inner_loop.hooks.base import (
     Decision,
@@ -184,6 +190,7 @@ class LoopGuard(GuardMiddleware):
             # error from the warn sink and move on.
             pass
 
+    @override
     def handle(self, point: LifecyclePoint, payload: HookPayload) -> Decision:
         if point is LifecyclePoint.BEFORE_TOOL_EXEC:
             self._record(payload)
